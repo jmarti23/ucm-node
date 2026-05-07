@@ -1,0 +1,12 @@
+[Unit]
+Description=UCM SN54 Sensor Node
+After=network.target
+
+[Service]
+User=jmarti23
+WorkingDirectory=/opt/ucm
+ExecStart=/opt/ucm/venv/bin/python /opt/ucm/sen54_mqtt.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
