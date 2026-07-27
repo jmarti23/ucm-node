@@ -1,0 +1,12 @@
+Known Config
+(venv) PS C:\esp\projects\wifi_test> where.exe python
+C:\Espressif\tools\python\v5.5.5\venv\Scripts\python.exe
+C:\Users\Jim Martinez\scoop\apps\python313\current\python.exe
+C:\Users\Jim Martinez\AppData\Local\Microsoft\WindowsApps\python.exe
+(venv) PS C:\esp\projects\wifi_test> where.exe cmake
+C:\Espressif\tools\tools\cmake\3.30.2\bin\cmake.exe
+(venv) PS C:\esp\projects\wifi_test> where.exe ninja
+C:\Espressif\tools\tools\ninja\1.12.1\ninja.exe
+(venv) PS C:\esp\projects\wifi_test> where.exe riscv32-esp-elf-gcc
+C:\Espressif\tools\tools\riscv32-esp-elf\esp-14.2.0_20260121\riscv32-esp-elf\bin\riscv32-esp-elf-gcc.exe
+(venv) PS C:\esp\projects\wifi_test>

@@ -1,0 +1,16 @@
+# ESP-IDF build output
+build/
+
+# Python virtual environments
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# ESP-IDF generated files
+sdkconfig.old
+
+# Operating system files
+Thumbs.db
+.DS_Store
