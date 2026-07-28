@@ -4,6 +4,6 @@ dependencies:
 
   espressif/esp_wifi_remote: "~0.5.4"
   espressif/esp_hosted: "~2.7.0"
-
+  espressif/mdns: "~1.11.0"
   esp-idf-lib/i2cdev: ^2.1.1
   espressif/mqtt: "^1.0.0"

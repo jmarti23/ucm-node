@@ -1,8 +1,7 @@
 idf_component_register(
-    SRCS "wifi_test.c" "sen54_data.c" "web_server.c"
+    SRCS "wifi_test.c" "sen54_data.c" "web_server.c" "app_wifi_prov.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
-        wifi_provisioning
         nvs_flash
         sen5x
         esp_wifi
@@ -10,6 +9,7 @@ idf_component_register(
         esp_netif
         esp_system
 	esp_http_server
+        mdns
         log
         i2cdev
 )

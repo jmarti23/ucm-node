@@ -93,6 +93,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.5.5
+  espressif/mdns:
+    component_hash: e81ca7a7f53ea34e78274df054da692c272e1315572876b237b1748e267c013b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.3
   espressif/mqtt:
     component_hash: ffdad5659706b4dc14bc63f8eb73ef765efa015bf7e9adf71c813d52a2dc9342
     dependencies:
@@ -111,8 +121,9 @@ direct_dependencies:
 - esp-idf-lib/i2cdev
 - espressif/esp_hosted
 - espressif/esp_wifi_remote
+- espressif/mdns
 - espressif/mqtt
 - idf
-manifest_hash: b36287460446904415393c68e85988af354ee4f40971cb27d35a0ff5c11d0c26
+manifest_hash: 1b89adfa24525551e4e7681f1df7e6a68e522a17b951272330ab1feace81ac05
 target: esp32p4
 version: 2.0.0
