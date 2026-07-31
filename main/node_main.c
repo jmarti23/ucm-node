@@ -1,27 +1,34 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+
+#include <stdio.h>
+#include <stdint.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 
-#include "esp_system.h"
-#include "esp_wifi_remote.h"
-#include "esp_event.h"
-#include "esp_log.h"
 #include "nvs_flash.h"
-#include "esp_netif.h"
+
+#include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif_sntp.h"
 
+#include "network_manager.h"
+#include "app_wifi_prov.h"
 #include "esp_http_server.h"
-#include "web_server.h"
+
 #include "sen54_data.h"
-#include "mqtt_client.h"
 #include "sen5x_i2c.h"
 #include "sensirion_i2c_hal.h"
 #include "sensirion_i2c_esp32_config.h"
+
+#include "mqtt_client.h"
+
 #include "i2cdev.h"
-#include "app_wifi_prov.h"
+
+#include "web_server.h"
+
 
 // SEN5x I2C
 #define SEN5X_SDA      GPIO_NUM_7
@@ -31,18 +38,29 @@
 
 #define MQTT_BROKER_URI "mqtt://192.168.1.236"
 
+#define ETHERNET_TIMEOUT_MS 30000
+
 static const char *TAG = "P4_SENSOR_TEST";
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 
 // Derives a stable, unique node ID from the board's MAC address, e.g.
 // "UCM-A1B2C3" -- guaranteed different per physical device, no manual
 // config needed, and stable across reboots since MAC doesn't change.
+
 static void generate_node_id(char *out, size_t out_size)
 {
     uint8_t mac[6];
-    esp_efuse_mac_get_default(mac);
-    snprintf(out, out_size, "UCM-%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
+
+    snprintf(out,
+             out_size,
+             "UCM-%02X%02X%02X",
+             mac[3],
+             mac[4],
+             mac[5]);
 }
+
 static void mqtt_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -204,51 +222,92 @@ static void sen5x_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "ENTERED app_main");
+
     esp_err_t ret = nvs_flash_init();
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || 
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
+
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "Starting ESP32-P4 Wi-Fi + SEN5x test");
+    ESP_LOGI(TAG, "Starting UCM ESP32-P4 environmental node");
 
     ESP_LOGI(TAG, "BEFORE SEN5X");
     sen5x_init();
     ESP_LOGI(TAG, "AFTER SEN5X");
 
+
     esp_err_t network_result = network_start();
-    if (wifi_result != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi failed to connect");
+
+    if (network_result != ESP_OK) {
+
+        ESP_LOGE(TAG, "Network initialization failed");
+
     } else {
+
         time_sync_start();
 
         char node_name[32] = {0};
         char node_desc[64] = {0};
-        float lat = 0.0f, lon = 0.0f;
-        app_wifi_prov_get_node_info(node_name, sizeof(node_name),
-                                     node_desc, sizeof(node_desc), &lat, &lon);
+        float lat = 0.0f;
+        float lon = 0.0f;
 
-        strncpy(current_sensor_data.node_name, node_name, sizeof(current_sensor_data.node_name) - 1);
-        strncpy(current_sensor_data.description, node_desc, sizeof(current_sensor_data.description) - 1);
+        app_wifi_prov_get_node_info(
+            node_name,
+            sizeof(node_name),
+            node_desc,
+            sizeof(node_desc),
+            &lat,
+            &lon
+        );
+
+        strncpy(current_sensor_data.node_name,
+                node_name,
+                sizeof(current_sensor_data.node_name) - 1);
+
+        strncpy(current_sensor_data.description,
+                node_desc,
+                sizeof(current_sensor_data.description) - 1);
+
         current_sensor_data.latitude = lat;
         current_sensor_data.longitude = lon;
-    }
 
-    mqtt_start();
 
-    if (wifi_result == ESP_OK) {
-        generate_node_id(current_sensor_data.node_id, sizeof(current_sensor_data.node_id));
-        ESP_LOGI(TAG, "Node ID: %s", current_sensor_data.node_id);
+
+        generate_node_id(
+            current_sensor_data.node_id,
+            sizeof(current_sensor_data.node_id)
+        );
+
+        ESP_LOGI(TAG, "Node ID: %s",
+                 current_sensor_data.node_id);
+
+        mqtt_start();
+
         mqtt_publish_node_info();
     }
+
+
     start_webserver();
 
-    xTaskCreate(sen5x_task, "sen5x_task", 4096, NULL, 5, NULL);
+    xTaskCreate(
+        sen5x_task,
+        "sen5x_task",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
+
 
     while (1) {
+
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGI(TAG, "P4 Wi-Fi Link Active...");
+
+        ESP_LOGI(TAG, "Network Active...");
     }
 }

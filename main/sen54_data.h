@@ -3,7 +3,11 @@
 
 typedef struct {
     char node_id[16];
-
+    char node_name[32];
+    char description[64];
+    float latitude;
+    float longitude;
+    char timestamp[24];   // e.g. "2026-07-28T14:32:05Z"
     float pm1;
     float pm25;
     float pm4;
@@ -12,9 +16,7 @@ typedef struct {
     float humidity;
     float voc;
     float nox;
-
 } sen54_data_t;
-
 
 extern sen54_data_t current_sensor_data;
 

@@ -1,4 +1,6 @@
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "app_wifi_prov.h"
 
 #include "esp_log.h"
@@ -19,6 +21,10 @@ static const char *TAG = "app_wifi_prov";
 #define NVS_NAMESPACE   "wifi_cfg"
 #define NVS_KEY_SSID    "ssid"
 #define NVS_KEY_PASS    "pass"
+#define NVS_KEY_NAME    "node_name"
+#define NVS_KEY_DESC    "node_desc"
+#define NVS_KEY_LAT     "node_lat"
+#define NVS_KEY_LON     "node_lon"
 #define MAXIMUM_RETRY   5
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -26,27 +32,44 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT      BIT1
 static int s_retry_num = 0;
 
-// Simple form page. No JS framework, no CSS files -- just works in any
-// phone browser without extra requests.
+// Cached after a successful load/save so app_wifi_prov_get_node_info()
+// can hand it back without re-touching NVS.
+static char s_node_name[32] = {0};
+static char s_node_desc[64] = {0};
+static float s_node_lat = 0.0f;
+static float s_node_lon = 0.0f;
+
+// Setup form: Wi-Fi credentials + node identity/location fields.
 static const char SETUP_FORM_HTML[] =
 "<!DOCTYPE html><html><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-"<title>Wi-Fi Setup</title>"
+"<title>Sensor Setup</title>"
 "<style>"
 "body{font-family:sans-serif;background:#111;color:#eee;padding:24px;}"
 "h1{font-size:1.2em;color:#8ab4f8;}"
+"h2{font-size:1em;color:#8ab4f8;margin-top:28px;}"
 "label{display:block;margin-top:16px;font-size:0.9em;color:#aaa;}"
 "input{width:100%;padding:10px;margin-top:4px;border-radius:8px;"
 "border:none;font-size:1em;box-sizing:border-box;}"
-"button{margin-top:24px;width:100%;padding:12px;border-radius:8px;"
+"button{margin-top:28px;width:100%;padding:12px;border-radius:8px;"
 "border:none;background:#8ab4f8;color:#111;font-size:1em;font-weight:600;}"
 "</style></head><body>"
-"<h1>Connect the sensor to your Wi-Fi</h1>"
+"<h1>Set up this sensor</h1>"
 "<form method='POST' action='/save'>"
-"<label>Wi-Fi network name (SSID)</label>"
+"<h2>Wi-Fi</h2>"
+"<label>Network name (SSID)</label>"
 "<input name='ssid' required>"
 "<label>Password</label>"
 "<input name='pass' type='password'>"
+"<h2>Sensor info (optional)</h2>"
+"<label>Node name (e.g. Lobby, Warehouse-2)</label>"
+"<input name='name' maxlength='31'>"
+"<label>Description</label>"
+"<input name='desc' maxlength='63'>"
+"<label>Latitude</label>"
+"<input name='lat' type='text' inputmode='decimal' placeholder='e.g. 40.7128'>"
+"<label>Longitude</label>"
+"<input name='lon' type='text' inputmode='decimal' placeholder='e.g. -74.0060'>"
 "<button type='submit'>Save &amp; Connect</button>"
 "</form></body></html>";
 
@@ -65,8 +88,8 @@ static esp_err_t form_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, SETUP_FORM_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-// Minimal application/x-www-form-urlencoded decoder for our two fields.
-// Good enough for SSID/password text -- handles %XX and + escapes.
+// Minimal application/x-www-form-urlencoded decoder.
+// Handles %XX and + escapes -- good enough for our text fields.
 static void url_decode(char *dst, const char *src, size_t dst_size)
 {
     size_t di = 0;
@@ -92,14 +115,12 @@ static bool extract_field(const char *body, const char *key, char *out, size_t o
     snprintf(search, sizeof(search), "%s=", key);
     const char *found = strstr(body, search);
     if (!found) {
+        out[0] = '\0';
         return false;
     }
     found += strlen(search);
     const char *end = strchr(found, '&');
     size_t raw_len = end ? (size_t)(end - found) : strlen(found);
-    if (raw_len >= out_size) {
-        raw_len = out_size - 1;
-    }
     char raw[128];
     if (raw_len >= sizeof(raw)) {
         raw_len = sizeof(raw) - 1;
@@ -112,7 +133,7 @@ static bool extract_field(const char *body, const char *key, char *out, size_t o
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    char body[256] = {0};
+    char body[512] = {0};
     int total = 0;
     int remaining = req->content_len;
     if (remaining >= (int)sizeof(body)) {
@@ -132,15 +153,29 @@ static esp_err_t save_post_handler(httpd_req_t *req)
 
     char ssid[64] = {0};
     char pass[64] = {0};
+    char name[32] = {0};
+    char desc[64] = {0};
+    char lat_str[32] = {0};
+    char lon_str[32] = {0};
+
     extract_field(body, "ssid", ssid, sizeof(ssid));
     extract_field(body, "pass", pass, sizeof(pass));
+    extract_field(body, "name", name, sizeof(name));
+    extract_field(body, "desc", desc, sizeof(desc));
+    extract_field(body, "lat", lat_str, sizeof(lat_str));
+    extract_field(body, "lon", lon_str, sizeof(lon_str));
 
-    ESP_LOGI(TAG, "Received setup form: SSID '%s'", ssid);
+    ESP_LOGI(TAG, "Received setup form: SSID '%s', name '%s'", ssid, name);
 
     nvs_handle_t nvs;
     ESP_ERROR_CHECK(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs));
     ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_SSID, ssid));
     ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_PASS, pass));
+    ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_NAME, name));
+    ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_DESC, desc));
+    // Stored as strings (NVS has no native float type); parsed back on load.
+    ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_LAT, lat_str[0] ? lat_str : "0"));
+    ESP_ERROR_CHECK(nvs_set_str(nvs, NVS_KEY_LON, lon_str[0] ? lon_str : "0"));
     ESP_ERROR_CHECK(nvs_commit(nvs));
     nvs_close(nvs);
 
@@ -187,8 +222,6 @@ static void start_setup_server_and_ap(void)
 
     ESP_LOGI(TAG, "Setup web server started");
 
-    // Board stays here indefinitely, serving the setup page, until the
-    // form is submitted (which calls esp_restart() itself).
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
@@ -228,9 +261,56 @@ esp_err_t app_wifi_prov_reset_credentials(void)
     return ESP_OK;
 }
 
+void app_wifi_prov_get_node_info(char *name, size_t name_size,
+                                  char *desc, size_t desc_size,
+                                  float *lat, float *lon)
+{
+    if (name && name_size) {
+        strncpy(name, s_node_name, name_size - 1);
+        name[name_size - 1] = '\0';
+    }
+    if (desc && desc_size) {
+        strncpy(desc, s_node_desc, desc_size - 1);
+        desc[desc_size - 1] = '\0';
+    }
+    if (lat) {
+        *lat = s_node_lat;
+    }
+    if (lon) {
+        *lon = s_node_lon;
+    }
+}
+
+// Turns a user-typed node name into a valid, unique-ish mDNS hostname:
+// lowercase, only [a-z0-9-], collapsed, truncated. Falls back to
+// "ucm-sensor" if the name is empty or ends up with nothing usable.
+static void sanitize_hostname(const char *in, char *out, size_t out_size)
+{
+    size_t oi = 0;
+    bool last_was_dash = false;
+    for (size_t i = 0; in[i] != '\0' && oi + 1 < out_size; i++) {
+        char c = in[i];
+        if (isalnum((unsigned char)c)) {
+            out[oi++] = (char)tolower((unsigned char)c);
+            last_was_dash = false;
+        } else if (!last_was_dash && oi > 0) {
+            out[oi++] = '-';
+            last_was_dash = true;
+        }
+    }
+    while (oi > 0 && out[oi - 1] == '-') {
+        oi--;
+    }
+    out[oi] = '\0';
+
+    if (out[0] == '\0') {
+        strncpy(out, "ucm-sensor", out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
 esp_err_t app_wifi_prov_start(void)
 {
-   
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -250,6 +330,23 @@ esp_err_t app_wifi_prov_start(void)
             nvs_get_str(nvs, NVS_KEY_PASS, pass, &pass_len);
             have_creds = true;
         }
+
+        size_t name_len = sizeof(s_node_name);
+        size_t desc_len = sizeof(s_node_desc);
+        nvs_get_str(nvs, NVS_KEY_NAME, s_node_name, &name_len);
+        nvs_get_str(nvs, NVS_KEY_DESC, s_node_desc, &desc_len);
+
+        char lat_str[32] = {0};
+        char lon_str[32] = {0};
+        size_t lat_len = sizeof(lat_str);
+        size_t lon_len = sizeof(lon_str);
+        if (nvs_get_str(nvs, NVS_KEY_LAT, lat_str, &lat_len) == ESP_OK) {
+            s_node_lat = strtof(lat_str, NULL);
+        }
+        if (nvs_get_str(nvs, NVS_KEY_LON, lon_str, &lon_len) == ESP_OK) {
+            s_node_lon = strtof(lon_str, NULL);
+        }
+
         nvs_close(nvs);
     }
 
@@ -259,6 +356,7 @@ esp_err_t app_wifi_prov_start(void)
     }
 
     ESP_LOGI(TAG, "Using saved Wi-Fi credentials, SSID '%s'", ssid);
+    ESP_LOGI(TAG, "Node name '%s', lat=%.5f lon=%.5f", s_node_name, s_node_lat, s_node_lon);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -285,17 +383,18 @@ esp_err_t app_wifi_prov_start(void)
         s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE, portMAX_DELAY);
 
-  if (bits & WIFI_CONNECTED_BIT) {
+    if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Successfully connected to AP SSID: %s", ssid);
 
-        // Advertise as ucm-sensor.local so it's reachable without
-        // knowing the site's DHCP-assigned IP.
+        char hostname[32];
+        sanitize_hostname(s_node_name, hostname, sizeof(hostname));
+
         esp_err_t mdns_err = mdns_init();
         if (mdns_err == ESP_OK) {
-            mdns_hostname_set("ucm-sensor");
-            mdns_instance_name_set("UCM Sensor Dashboard");
+            mdns_hostname_set(hostname);
+            mdns_instance_name_set(s_node_desc[0] ? s_node_desc : "UCM Sensor Dashboard");
             mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-            ESP_LOGI(TAG, "mDNS started: http://ucm-sensor.local");
+            ESP_LOGI(TAG, "mDNS started: http://%s.local", hostname);
         } else {
             ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(mdns_err));
         }
@@ -304,13 +403,9 @@ esp_err_t app_wifi_prov_start(void)
     }
 
     ESP_LOGE(TAG, "Failed to connect to SSID: %s", ssid);
-       // --- Field-deployment fallback ---
-    // Couldn't connect with the saved network (wrong site, changed
-    // password, etc). Wipe the bad credentials and drop into the
-    // same browser-based setup flow, no computer/USB needed.
     ESP_LOGW(TAG, "Falling back to setup mode -- clearing saved credentials");
     app_wifi_prov_reset_credentials();
     esp_wifi_stop();
-    start_setup_server_and_ap();  // never returns
+    start_setup_server_and_ap(); // never returns
     return ESP_FAIL; // unreachable
 }
