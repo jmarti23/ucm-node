@@ -23,11 +23,11 @@
 #include "sensirion_i2c_hal.h"
 #include "sensirion_i2c_esp32_config.h"
 
-#include "mqtt_client.h"
-
 #include "i2cdev.h"
 
 #include "web_server.h"
+#include "mqtt_manager.h"
+
 
 
 // SEN5x I2C
@@ -41,7 +41,7 @@
 #define ETHERNET_TIMEOUT_MS 30000
 
 static const char *TAG = "P4_SENSOR_TEST";
-static esp_mqtt_client_handle_t mqtt_client = NULL;
+
 
 // Derives a stable, unique node ID from the board's MAC address, e.g.
 // "UCM-A1B2C3" -- guaranteed different per physical device, no manual
@@ -61,43 +61,6 @@ static void generate_node_id(char *out, size_t out_size)
              mac[5]);
 }
 
-static void mqtt_start(void)
-{
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-    };
-
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
-
-    ESP_LOGI(TAG, "MQTT started");
-}
-
-static void mqtt_publish_node_info(void)
-{
-    char info_payload[256];
-    snprintf(info_payload, sizeof(info_payload),
-             "{"
-             "\"node\":\"%s\","
-             "\"name\":\"%s\","
-             "\"description\":\"%s\","
-             "\"lat\":%.5f,"
-             "\"lon\":%.5f"
-             "}",
-             current_sensor_data.node_id,
-             current_sensor_data.node_name,
-             current_sensor_data.description,
-             current_sensor_data.latitude,
-             current_sensor_data.longitude);
-
-    char topic[48];
-    snprintf(topic, sizeof(topic), "ucm/node-%s/info", current_sensor_data.node_id);
-
-    // retain=1 (last arg)
-    esp_mqtt_client_publish(mqtt_client, topic, info_payload, 0, 1, 1);
-
-    ESP_LOGI(TAG, "Published node info (retained): %s", info_payload);
-}
 
 static void time_sync_start(void)
 {
@@ -172,9 +135,15 @@ static void sen5x_task(void *arg)
         }
 
         ESP_LOGI(TAG, "PM1.0=%.1f PM2.5=%.1f PM4.0=%.1f PM10=%.1f ug/m3",
-                 pm1p0 / 10.0f, pm2p5 / 10.0f, pm4p0 / 10.0f, pm10p0 / 10.0f);
+                 pm1p0 / 10.0f,
+                 pm2p5 / 10.0f,
+                 pm4p0 / 10.0f,
+                 pm10p0 / 10.0f);
+
         ESP_LOGI(TAG, "Temperature=%.1f C Humidity=%.1f %%RH VOC=%.1f",
-                 temperature / 200.0f, humidity / 100.0f, voc_index / 10.0f);
+                 temperature / 200.0f,
+                 humidity / 100.0f,
+                 voc_index / 10.0f);
 
 
         current_sensor_data.pm1 = pm1p0 / 10.0f;
@@ -185,37 +154,15 @@ static void sen5x_task(void *arg)
         current_sensor_data.humidity = humidity / 100.0f;
         current_sensor_data.voc = voc_index / 10.0f;
 
-        format_timestamp(current_sensor_data.timestamp, sizeof(current_sensor_data.timestamp));
+        format_timestamp(
+            current_sensor_data.timestamp,
+            sizeof(current_sensor_data.timestamp)
+        );
 
-        // Dynamic readings only -- node identity/location already sent
-        // once as a retained message via mqtt_publish_node_info().
-        char payload[256];
-        snprintf(payload, sizeof(payload),
-                 "{"
-                 "\"node\":\"%s\","
-                 "\"timestamp\":\"%s\","
-                 "\"pm1\":%.1f,"
-                 "\"pm25\":%.1f,"
-                 "\"pm4\":%.1f,"
-                 "\"pm10\":%.1f,"
-                 "\"temperature\":%.1f,"
-                 "\"humidity\":%.1f,"
-                 "\"voc\":%.1f"
-                 "}",
-                 current_sensor_data.node_id,
-                 current_sensor_data.timestamp,
-                 current_sensor_data.pm1,
-                 current_sensor_data.pm25,
-                 current_sensor_data.pm4,
-                 current_sensor_data.pm10,
-                 current_sensor_data.temperature,
-                 current_sensor_data.humidity,
-                 current_sensor_data.voc);
 
-		char topic[48];
-        	snprintf(topic, sizeof(topic), "ucm/node-%s/environment", current_sensor_data.node_id);
-
-        	esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+        mqtt_manager_publish_environment(
+            &current_sensor_data
+        );
     }
 }
 
@@ -286,9 +233,16 @@ void app_main(void)
         ESP_LOGI(TAG, "Node ID: %s",
                  current_sensor_data.node_id);
 
-        mqtt_start();
+if (mqtt_manager_start() == ESP_OK) {
 
-        mqtt_publish_node_info();
+    mqtt_manager_publish_node_info(
+        &current_sensor_data
+    );
+
+} else {
+
+    ESP_LOGE(TAG, "MQTT startup failed");
+}
     }
 
 
