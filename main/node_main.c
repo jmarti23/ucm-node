@@ -36,7 +36,7 @@
 #define SEN5X_I2C_PORT I2C_NUM_0
 #define SEN5X_ADDRESS  0x69
 
-#define MQTT_BROKER_URI "mqtt://192.168.1.236"
+// #define MQTT_BROKER_URI "mqtt://192.168.1.236"
 
 #define ETHERNET_TIMEOUT_MS 30000
 
@@ -163,6 +163,9 @@ static void sen5x_task(void *arg)
         mqtt_manager_publish_environment(
             &current_sensor_data
         );
+        mqtt_manager_publish_heartbeat(
+            &current_sensor_data
+        );
     }
 }
 
@@ -233,7 +236,7 @@ void app_main(void)
         ESP_LOGI(TAG, "Node ID: %s",
                  current_sensor_data.node_id);
 
-if (mqtt_manager_start() == ESP_OK) {
+if (mqtt_manager_start(current_sensor_data.node_id) == ESP_OK) {
 
     mqtt_manager_publish_node_info(
         &current_sensor_data

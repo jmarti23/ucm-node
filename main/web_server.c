@@ -6,42 +6,79 @@ static const char *TAG = "WEB_SERVER";
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    char html[900];
-    snprintf(html,
-             sizeof(html),
-             "<html>"
-             "<head>"
-             "<meta http-equiv='refresh' content='5'>"
-             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-             "</head>"
-             "<body>"
-             "<h1>%s</h1>"
-             "<p>%s</p>"
-             "<p>Location: %.5f, %.5f</p>"
-             "<p>Last reading: %s</p>"
-             "<h2>SEN54 Data</h2>"
-             "<p>PM1.0: %.1f ug/m3</p>"
-             "<p>PM2.5: %.1f ug/m3</p>"
-             "<p>PM4.0: %.1f ug/m3</p>"
-             "<p>PM10: %.1f ug/m3</p>"
-             "<p>Temperature: %.1f C</p>"
-             "<p>Humidity: %.1f %%</p>"
-             "<p>VOC Index: %.1f</p>"
-             "</body>"
-             "</html>",
-             current_sensor_data.node_name[0] ? current_sensor_data.node_name : "UCM Sensor Node",
-             current_sensor_data.description,
-             current_sensor_data.latitude,
-             current_sensor_data.longitude,
-             current_sensor_data.timestamp,
-             current_sensor_data.pm1,
-             current_sensor_data.pm25,
-             current_sensor_data.pm4,
-             current_sensor_data.pm10,
-             current_sensor_data.temperature,
-             current_sensor_data.humidity,
-             current_sensor_data.voc);
+    const char html[] =
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>UCM Sensor Dashboard</title>"
+        "<style>"
+        "body { font-family: Arial, sans-serif; margin: 20px; }"
+        "h1 { font-size: 28px; }"
+        ".card { border: 1px solid #ccc; border-radius: 8px; padding: 15px; margin-bottom: 15px; }"
+        ".value { font-size: 24px; font-weight: bold; }"
+        "</style>"
+        "</head>"
+
+        "<body>"
+
+        "<h1 id='name'>UCM Sensor Dashboard</h1>"
+
+        "<div class='card'>"
+        "<h2>Environment</h2>"
+        "<p>Temperature</p>"
+        "<div class='value'><span id='temperature'>--</span> C</div>"
+        "<p>Humidity</p>"
+        "<div class='value'><span id='humidity'>--</span> %</div>"
+        "</div>"
+
+        "<div class='card'>"
+        "<h2>Air Quality</h2>"
+        "<p>PM1.0: <span id='pm1'>--</span> ug/m3</p>"
+        "<p>PM2.5: <span id='pm25'>--</span> ug/m3</p>"
+        "<p>PM4.0: <span id='pm4'>--</span> ug/m3</p>"
+        "<p>PM10: <span id='pm10'>--</span> ug/m3</p>"
+        "<p>VOC Index: <span id='voc'>--</span></p>"
+        "</div>"
+
+        "<div class='card'>"
+        "<h2>Node Information</h2>"
+        "<p>ID: <span id='node'>--</span></p>"
+        "<p>Location: <span id='location'>--</span></p>"
+        "<p>Last Reading: <span id='timestamp'>--</span></p>"
+        "</div>"
+
+        "<script>"
+        "function updateData() {"
+        " fetch('/data')"
+        " .then(response => response.json())"
+        " .then(data => {"
+        " document.getElementById('name').innerHTML = data.name || 'UCM Sensor Node';"
+        " document.getElementById('temperature').innerHTML = data.temperature.toFixed(1);"
+        " document.getElementById('humidity').innerHTML = data.humidity.toFixed(1);"
+        " document.getElementById('pm1').innerHTML = data.pm1.toFixed(1);"
+        " document.getElementById('pm25').innerHTML = data.pm25.toFixed(1);"
+        " document.getElementById('pm4').innerHTML = data.pm4.toFixed(1);"
+        " document.getElementById('pm10').innerHTML = data.pm10.toFixed(1);"
+        " document.getElementById('voc').innerHTML = data.voc.toFixed(1);"
+        " document.getElementById('node').innerHTML = data.node;"
+        " document.getElementById('location').innerHTML = data.lat + ', ' + data.lon;"
+        " document.getElementById('timestamp').innerHTML = data.timestamp;"
+        " })"
+        " .catch(error => console.log(error));"
+        "}"
+
+        "updateData();"
+        "setInterval(updateData, 5000);"
+
+        "</script>"
+
+        "</body>"
+        "</html>";
+
+    httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+
     return ESP_OK;
 }
 
