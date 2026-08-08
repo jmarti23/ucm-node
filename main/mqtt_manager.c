@@ -1,3 +1,45 @@
+/**
+ * @file mqtt_manager.c
+ * @brief MQTT connectivity layer for a UCM sensor node -- owns the MQTT
+ *        client lifecycle, topic naming, and all outbound publishes
+ *        (node info, environment readings, heartbeats), plus a small
+ *        inbound command channel (currently just remote re-provisioning).
+ *
+ * This is the module that node_main.c's app_main()/sen5x_task() delegate
+ * to (mqtt_manager_start(), mqtt_manager_publish_node_info(),
+ * mqtt_manager_publish_environment(), mqtt_manager_publish_heartbeat())
+ * instead of talking to the esp-mqtt client directly, so all
+ * broker/topic/QoS/retain decisions live in one place.
+ *
+ * TOPIC LAYOUT (publish side, node-specific, all namespaced under
+ * "ucm/node-<node_id>/..."):
+ *   - ucm/node-<id>/status       "online"/"offline" presence, retained
+ *                                 (see publish_online_status() and the LWT
+ *                                 setup in mqtt_manager_start()).
+ *   - ucm/node-<id>/info         Static identity (name/description/lat/lon),
+ *                                 retained, published once via
+ *                                 mqtt_manager_publish_node_info().
+ *   - ucm/node-<id>/environment  Live sensor readings, NOT retained,
+ *                                 published every ~1s via
+ *                                 mqtt_manager_publish_environment().
+ *   - ucm/node-<id>/heartbeat    Uptime/free-heap/Wi-Fi RSSI health data,
+ *                                 NOT retained, published alongside every
+ *                                 environment reading via
+ *                                 mqtt_manager_publish_heartbeat().
+ *
+ * TOPIC LAYOUT (subscribe side): see mqtt_event_handler()'s
+ * MQTT_EVENT_CONNECTED case -- subscribes to "ucm/node/+/command". Note
+ * this uses a *slash* between "node" and the wildcard segment, which does
+ * not match the "node-<id>" (hyphenated, no wildcard) pattern used
+ * everywhere else in this file for publishing. This is flagged in detail
+ * at that subscription site below.
+ *
+ * BROKER DISCOVERY: connects to "mqtt://UCM-HUB.local", an mDNS hostname
+ * rather than a hardcoded IP (contrast with the earlier draft firmware's
+ * hardcoded broker IP) -- this assumes mDNS/Bonjour resolution is enabled
+ * and working on the network the node is deployed on.
+ */
+
 #include <stdio.h>
 #include <string.h>
 
@@ -5,23 +47,48 @@
 
 #include "mqtt_client.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_wifi.h"
-#include "esp_timer.h"
-#include "app_wifi_prov.h"
+#include "esp_heap_caps.h"   // esp_get_free_heap_size(), used in the heartbeat payload
+#include "esp_wifi.h"        // esp_wifi_sta_get_ap_info(), used to read Wi-Fi RSSI for the heartbeat
+#include "esp_timer.h"       // esp_timer_get_time(), used to compute uptime for the heartbeat
+#include "app_wifi_prov.h"   // app_wifi_prov_reset_credentials(), used by the remote "provision" command
 
 
+// Broker address as an mDNS hostname (".local") rather than a static IP,
+// so this doesn't need to be reconfigured if the broker's IP changes --
+// relies on mDNS resolution being available on the network.
 #define MQTT_BROKER_URI "mqtt://UCM-HUB.local"
 
 static const char *TAG = "MQTT_MANAGER";
 
+// Single MQTT client instance for this node; NULL until
+// mqtt_manager_start() has run. All publish functions below guard on this
+// being non-NULL so they safely no-op (return ESP_FAIL) if called before
+// start or if start was never called/succeeded.
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 
+// Module-level state populated once in mqtt_manager_start() and reused by
+// publish_online_status() and the LWT (Last Will and Testament) config;
+// kept as fixed-size buffers rather than allocated per-call since they're
+// needed for the lifetime of the MQTT connection (the LWT payload/topic
+// pointers handed to esp-mqtt at connect time must remain valid for as
+// long as the client is running).
 static char s_node_id[32];
 static char s_status_topic[64];
 static char s_lwt_payload[96];
 
 
+/**
+ * @brief Publishes a retained "online" presence message for this node.
+ *
+ * Called once the MQTT connection is established (see
+ * MQTT_EVENT_CONNECTED below). This is the counterpart to the LWT
+ * ("offline") message configured in mqtt_manager_start(): together they
+ * let subscribers always know, via the retained ucm/node-<id>/status
+ * topic, whether this node is currently connected -- "online" while
+ * connected (set here), automatically flipped to "offline" by the broker
+ * itself if the client disconnects ungracefully (network drop, crash,
+ * power loss) without this node getting a chance to say so.
+ */
 static void publish_online_status(void)
 {
     char payload[96];
@@ -33,6 +100,30 @@ static void publish_online_status(void)
 }
 
 
+/**
+ * @brief esp-mqtt event callback, registered with the client in
+ *        mqtt_manager_start(). Handles connection lifecycle and incoming
+ *        command messages.
+ *
+ * @param handler_args  Unused (registered with NULL as the handler arg).
+ * @param base           Unused (event base, always the MQTT event base
+ *                        here since this handler is only registered for
+ *                        MQTT client events).
+ * @param event_id       Which MQTT event fired; cast to
+ *                        esp_mqtt_event_id_t and switched on below.
+ * @param event_data     Event payload, cast to esp_mqtt_event_handle_t.
+ *
+ * Handled events:
+ *   - MQTT_EVENT_CONNECTED: subscribes to the command topic and announces
+ *     this node as online (see subscribe/publish notes below).
+ *   - MQTT_EVENT_DATA: a message arrived on a subscribed topic; currently
+ *     the only command recognized is a hardcoded "provision" request that
+ *     triggers a factory-reset-and-reboot into provisioning mode.
+ *   - All other event IDs (disconnect, subscribed, published, error, etc.)
+ *     are ignored (default: break) -- e.g. there's no explicit handling of
+ *     MQTT_EVENT_DISCONNECTED here; reconnection is left entirely to
+ *     esp-mqtt's built-in auto-reconnect behavior.
+ */
 static void mqtt_event_handler(void *handler_args,
                                esp_event_base_t base,
                                int32_t event_id,
@@ -46,6 +137,21 @@ static void mqtt_event_handler(void *handler_args,
         ESP_LOGI(TAG, "MQTT connected");
 
         char topic[64];
+        // NOTE: this subscribes to "ucm/node/+/command" -- with a SLASH
+        // between "node" and the single-level wildcard "+". Every publish
+        // topic elsewhere in this file uses a hyphen instead
+        // ("ucm/node-<id>/..."), with no wildcard segment. As written,
+        // this subscription will only match topics literally shaped like
+        // "ucm/node/<anything>/command" -- it will NOT match a topic like
+        // "ucm/node-AB12CD/command" that mirrors this node's own
+        // publish-side naming convention. If commands are meant to be
+        // addressed per-node the same way status/info/environment/
+        // heartbeat topics are, this subscription pattern likely needs to
+        // change to match (e.g. "ucm/node-+/command" or
+        // "ucm/node-%s/command" with s_node_id substituted in, depending
+        // on whether commands should be broadcast to all nodes or targeted
+        // at this one). Left as-is here per instructions not to alter the
+        // code; flagging for whoever picks this up next.
         snprintf(topic, sizeof(topic), "ucm/node/+/command");
 
         ESP_LOGI(TAG, "Subscribe topic='%s' length=%d", topic, strlen(topic));
@@ -63,8 +169,22 @@ static void mqtt_event_handler(void *handler_args,
         ESP_LOGI(TAG, "MQTT command topic: %.*s", event->topic_len, event->topic);
         ESP_LOGI(TAG, "MQTT command data: %.*s", event->data_len, event->data);
 
+        // Recognizes exactly one command payload: a literal
+        // {"command":"provision"} JSON blob. This is a strict byte-for-byte
+        // match (no JSON parsing), so any whitespace/key-ordering/
+        // additional-fields difference in the incoming payload will fail
+        // to match. NOTE: event->data is not guaranteed to be
+        // NUL-terminated by esp-mqtt (its length is given separately via
+        // event->data_len), and if event->data_len is longer than this
+        // comparison string's length (24 bytes), strncmp will read past
+        // the end of the string literal's storage while comparing --
+        // relying on the incoming payload never being longer than the
+        // expected command for this to stay in-bounds in practice.
         if (strncmp(event->data, "{\"command\":\"provision\"}", event->data_len) == 0) {
             ESP_LOGW(TAG, "Provision command received");
+            // Wipes stored Wi-Fi/provisioning credentials and reboots the
+            // device, dropping it back into provisioning mode -- this is
+            // effectively a remote factory-reset trigger for the node.
             app_wifi_prov_reset_credentials();
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_restart();
@@ -78,6 +198,36 @@ static void mqtt_event_handler(void *handler_args,
 }
 
 
+/**
+ * @brief Initializes node identity/topic/LWT state, then creates,
+ *        registers callbacks for, and starts the MQTT client.
+ *
+ * @param node_id  This node's unique ID string (see generate_node_id() in
+ *                 node_main.c), copied into module-local storage.
+ * @return ESP_OK once the client has been created and esp_mqtt_client_start()
+ *         has been called. Note: this reflects that the *start* call
+ *         succeeded, not that a broker connection has actually been
+ *         established yet -- esp-mqtt connects asynchronously, and actual
+ *         connection success is only known once MQTT_EVENT_CONNECTED fires
+ *         in mqtt_event_handler(). ESP_ERROR_CHECK() is used on the
+ *         registration/start calls, so a genuine failure there aborts
+ *         firmware boot rather than returning an error code from this
+ *         function.
+ *
+ * Sets up:
+ *   - s_node_id / s_status_topic / s_lwt_payload: node-specific state
+ *     used both here and later by publish_online_status().
+ *   - The MQTT Last Will and Testament (LWT): tells the broker to
+ *     automatically publish an "offline" status message (retained) to
+ *     this node's status topic if the client disconnects without cleanly
+ *     signing off -- see publish_online_status() for the "online"
+ *     counterpart. This is how downstream consumers detect a node going
+ *     dark (crash, power loss, network failure) without needing their own
+ *     timeout logic.
+ *   - Registers mqtt_event_handler() for ESP_EVENT_ANY_ID, i.e. all MQTT
+ *     client events, not just the ones actually handled in the switch
+ *     statement there.
+ */
 esp_err_t mqtt_manager_start(const char *node_id)
 {
     strncpy(s_node_id, node_id, sizeof(s_node_id) - 1);
@@ -117,6 +267,22 @@ esp_err_t mqtt_manager_start(const char *node_id)
 }
 
 
+/**
+ * @brief Publishes this node's static identity (ID, name, description,
+ *        GPS coordinates) as a retained MQTT message.
+ *
+ * @param data  Pointer to the node's current sensor/identity data struct
+ *              (only the identity fields -- node_id/node_name/description/
+ *              latitude/longitude -- are used here).
+ * @return ESP_FAIL if the MQTT client hasn't been started yet
+ *         (mqtt_client == NULL); ESP_OK otherwise (this does not confirm
+ *         the publish was actually delivered/acked, only that it was
+ *         handed to the client).
+ *
+ * Published retained (see esp_mqtt_client_publish()'s last argument = 1)
+ * to ucm/node-<id>/info, so new subscribers immediately learn a node's
+ * identity/location without this node needing to resend it.
+ */
 esp_err_t mqtt_manager_publish_node_info(sen54_data_t *data)
 {
     if (!mqtt_client) {
@@ -150,6 +316,23 @@ esp_err_t mqtt_manager_publish_node_info(sen54_data_t *data)
 }
 
 
+/**
+ * @brief Publishes a live environmental sensor reading (PM1/2.5/4/10,
+ *        temperature, humidity, VOC) as a non-retained MQTT message.
+ *
+ * @param data  Pointer to the node's current sensor data struct; all
+ *              fields here are expected to already be populated/scaled
+ *              (see sen5x_task() in node_main.c, which converts the raw
+ *              sensor integer readings to physical units before calling
+ *              this).
+ * @return ESP_FAIL if the MQTT client hasn't been started yet; ESP_OK
+ *         otherwise.
+ *
+ * Published NOT retained (last argument = 0) to
+ * ucm/node-<id>/environment, since a stale reading should never be handed
+ * to a new subscriber as if it were current -- unlike node info or
+ * status, which describe things that don't (or rarely) change.
+ */
 esp_err_t mqtt_manager_publish_environment(sen54_data_t *data)
 {
     if (!mqtt_client) {
@@ -189,6 +372,36 @@ esp_err_t mqtt_manager_publish_environment(sen54_data_t *data)
 }
 
 
+/**
+ * @brief Publishes a node health/liveness message: uptime, free heap, and
+ *        Wi-Fi signal strength.
+ *
+ * @param data  Pointer to the node's current sensor data struct; only
+ *              node_id and timestamp are used from it here (the rest of
+ *              the payload is computed fresh each call, below).
+ * @return ESP_FAIL if the MQTT client hasn't been started yet; ESP_OK
+ *         otherwise.
+ *
+ * Computes, at call time:
+ *   - free_heap: current free heap size (esp_get_free_heap_size()) --
+ *     useful for spotting memory leaks in the field over time.
+ *   - uptime_s: seconds since boot, derived from esp_timer_get_time()
+ *     (which returns microseconds since boot) divided down to whole
+ *     seconds.
+ *   - rssi: current Wi-Fi access point signal strength, read via
+ *     esp_wifi_sta_get_ap_info(). If that call fails (e.g. because this
+ *     node is on Ethernet/PoE rather than Wi-Fi station mode, or is
+ *     between reconnects), rssi silently stays at its initialized value
+ *     of 0 rather than surfacing the failure -- a 0 dBm reading in the
+ *     published payload should be interpreted with that in mind rather
+ *     than taken as a literal signal strength.
+ *
+ * Published NOT retained (last argument = 0) to
+ * ucm/node-<id>/heartbeat, for the same reason as environment readings --
+ * a stale heartbeat shouldn't look like a live one to a new subscriber.
+ * Called once per second alongside mqtt_manager_publish_environment() (see
+ * sen5x_task() in node_main.c).
+ */
 esp_err_t mqtt_manager_publish_heartbeat(sen54_data_t *data)
 {
     if (!mqtt_client) {

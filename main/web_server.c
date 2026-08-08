@@ -1,9 +1,70 @@
+/**
+ * @file web_server.c
+ * @brief Local HTTP status dashboard for a UCM sensor node.
+ *
+ * Starts a small embedded HTTP server (ESP-IDF's esp_http_server) with two
+ * routes:
+ *   - GET /       Serves a self-contained HTML/CSS/JS dashboard page that
+ *                  displays the node's latest readings, polling itself
+ *                  every 5 seconds.
+ *   - GET /data   Serves the current sensor/node data as JSON; this is
+ *                  what the dashboard page's JS polls, but it's also a
+ *                  plain machine-readable endpoint on its own (e.g. for
+ *                  curl/scripts/other tooling on the local network).
+ *
+ * This gives anyone on the local network a live view of one specific
+ * node's readings by browsing directly to its IP/hostname, independent of
+ * MQTT/the broker/any backend dashboard -- useful for on-site debugging,
+ * install verification, or simple standalone use without any other
+ * project infrastructure running.
+ *
+ * Data source: reads directly from the shared, global current_sensor_data
+ * struct (declared in sen54_data.h) that node_main.c's sen5x_task() writes
+ * to once per second -- there is no separate copy or caching layer here,
+ * so /data always reflects whatever the most recent write left in that
+ * struct (see the note on data_handler() below about the lack of
+ * synchronization).
+ */
+
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "sen54_data.h"
+#include "sen54_data.h"   // current_sensor_data -- the shared struct this server reads from
 
 static const char *TAG = "WEB_SERVER";
 
+/**
+ * @brief HTTP handler for GET / -- serves the dashboard's HTML page.
+ *
+ * @param req  Incoming request handle, provided by esp_http_server.
+ * @return ESP_OK (httpd_resp_send()'s result isn't checked/propagated).
+ *
+ * The page itself does not contain any live values -- every field starts
+ * as a "--" placeholder <span>, and is filled in client-side by the
+ * embedded JavaScript, which:
+ *   1. Runs updateData() immediately on load, and again every 5 seconds
+ *      (setInterval(updateData, 5000)).
+ *   2. Each call fetches GET /data (see data_handler() below), parses it
+ *      as JSON, and writes each field into its corresponding element by
+ *      ID (e.g. data.temperature -> the #temperature span).
+ *   3. Silently logs (console.log) any fetch/parse error rather than
+ *      showing an error state in the UI -- e.g. if the node's own /data
+ *      endpoint is briefly unavailable, the page will just keep showing
+ *      the last successfully fetched values (or "--" if it never
+ *      succeeded) without any visible warning to the viewer.
+ *
+ * NOTE: the JS references data.name (used to set the page's <h1>, falling
+ * back to "UCM Sensor Node" if absent via `data.name || 'UCM Sensor
+ * Node'`), but data_handler() below does not actually include a "name"
+ * field in its JSON output (it sends node_name under other UI fields but
+ * not this one) -- so the heading will always fall back to the default
+ * text rather than showing the node's configured name. Harmless (the `||`
+ * fallback prevents a JS error), but likely not the intended behavior.
+ *
+ * The entire page is a single hardcoded C string (html[]) built and sent
+ * in one shot via httpd_resp_send() with HTTPD_RESP_USE_STRLEN, i.e. no
+ * templating -- any dashboard layout/styling changes require editing this
+ * string directly and reflashing.
+ */
 static esp_err_t root_handler(httpd_req_t *req)
 {
     const char html[] =
@@ -82,6 +143,34 @@ static esp_err_t root_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * @brief HTTP handler for GET /data -- serves the node's current sensor
+ *        and identity data as a JSON object.
+ *
+ * @param req  Incoming request handle, provided by esp_http_server.
+ * @return ESP_OK (httpd_resp_send()'s result isn't checked/propagated).
+ *
+ * Reads directly from the shared global current_sensor_data struct (same
+ * one node_main.c's sen5x_task() writes to once per second, and the same
+ * one mqtt_manager.c's publish functions read from) and formats it as a
+ * single flat JSON object mirroring the same fields published over MQTT
+ * (node/name/description/lat/lon/timestamp + the PM/temperature/humidity/
+ * VOC readings).
+ *
+ * NOTE: current_sensor_data's string fields (node_name, description,
+ * timestamp, node_id) are inserted into this JSON via plain %s with no
+ * escaping. If any of those ever contained a double-quote or backslash
+ * character (e.g. a node name/description set via provisioning), the
+ * resulting JSON would be malformed and could fail to parse in the
+ * dashboard's fetch(...).json() call. In practice this depends on
+ * whatever validates/sanitizes those fields at provisioning time
+ * elsewhere in the project.
+ *
+ * NOTE: as with the sensor task in node_main.c, there is no mutex/lock
+ * around reads of current_sensor_data here, so a request handled while
+ * sen5x_task() is mid-update could theoretically read a partially updated
+ * struct (e.g. some fields from an old reading, some from a new one).
+ */
 static esp_err_t data_handler(httpd_req_t *req)
 {
     char json[512];
@@ -120,6 +209,28 @@ static esp_err_t data_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * @brief Starts the local HTTP server and registers the / and /data
+ *        routes. Called once from node_main.c's app_main(),
+ *        unconditionally (regardless of whether networking/MQTT setup
+ *        succeeded), so this dashboard is available whenever the node has
+ *        any IP connectivity at all.
+ *
+ * Uses esp_http_server's default configuration (HTTPD_DEFAULT_CONFIG()) --
+ * i.e. default port (80), default max URI handlers, default stack size,
+ * etc. -- rather than customizing any server settings.
+ *
+ * NOTE: if httpd_start() fails, this function does nothing further (no
+ * else branch) -- no error is logged, and the caller (app_main()) has no
+ * way to know the web server didn't come up, since this function has a
+ * void return type. If the dashboard is unexpectedly unreachable on a
+ * given node, this silent-failure path is worth checking first.
+ *
+ * NOTE: the local `server` handle is not stored anywhere outside this
+ * function (e.g. in a static/module-level variable), so there is
+ * currently no way for any other code to later call httpd_stop() on this
+ * server -- once started, it runs for the lifetime of the firmware.
+ */
 void start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
