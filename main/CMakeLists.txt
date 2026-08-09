@@ -27,7 +27,8 @@ idf_component_register(
     # Every .c file that is compiled as part of this firmware component.
     # If a new .c file is added to the project, it must be added here or
     # ESP-IDF's build system will not compile it in.
-    SRCS "node_main.c" "sen54_data.c" "web_server.c" "app_wifi_prov.c" "ethernet_manager.c" "ethernet_init.c" "network_manager.c" "mqtt_manager.c"
+
+    SRCS "node_main.c" "sen54_data.c" "web_server.c" "app_wifi_prov.c" "ethernet_manager.c" "ethernet_init.c" "network_manager.c" "mqtt_manager.c" "ota_manager.c"
 
     # Directories searched for this component's own headers (e.g.
     # sen54_data.h, web_server.h, mqtt_manager.h, app_wifi_prov.h). "."
@@ -52,7 +53,11 @@ idf_component_register(
         esp_system            # Core system APIs -- e.g. esp_restart(), MAC address access (node_main.c, mqtt_manager.c)
         esp_eth                # Ethernet driver support -- used by ethernet_manager.c / ethernet_init.c
 	esp_http_server           # HTTP server framework -- used by web_server.c
-        mdns                       # mDNS resolution -- required to resolve the "UCM-HUB.local" MQTT broker hostname (mqtt_manager.c)
+        esp_http_client
+        esp_https_ota
+	mdns                       # mDNS resolution -- required to resolve the "UCM-HUB.local" MQTT broker hostname (mqtt_manager.c)
         log                         # ESP_LOG* logging macros -- used throughout every source file in this component
         i2cdev                       # esp-idf-lib I2C device abstraction -- used by node_main.c's SEN5x I2C bring-up
+        app_update
+        bootloader_support
 )

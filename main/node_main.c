@@ -54,6 +54,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#include "ota_manager.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -375,19 +377,28 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ENTERED app_main");
 
-    esp_err_t ret = nvs_flash_init();
+esp_err_t ret = nvs_flash_init();
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || 
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+    ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+}
 
-    ESP_ERROR_CHECK(ret);
+ESP_ERROR_CHECK(ret);
+
+esp_err_t ota_result = ota_manager_init();
+
+if (ota_result != ESP_OK) {
+    ESP_LOGE(TAG, "OTA initialization failed: %s",
+             esp_err_to_name(ota_result));
+} else {
+    ESP_LOGI(TAG, "OTA manager initialized");
+}
 
     ESP_LOGI(TAG, "Starting UCM ESP32-P4 environmental node");
-
+   
     ESP_LOGI(TAG, "BEFORE SEN5X");
     sen5x_init();
     ESP_LOGI(TAG, "AFTER SEN5X");
@@ -455,6 +466,15 @@ if (mqtt_manager_start(current_sensor_data.node_id) == ESP_OK) {
 
 
     start_webserver();
+esp_err_t ota_confirm_result = ota_manager_confirm_running_image();
+
+if (ota_confirm_result != ESP_OK) {
+    ESP_LOGE(TAG,
+             "OTA firmware confirmation failed: %s",
+             esp_err_to_name(ota_confirm_result));
+} else {
+    ESP_LOGI(TAG, "OTA firmware confirmed successfully");
+}
 
     xTaskCreate(
         sen5x_task,
