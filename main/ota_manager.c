@@ -1,39 +1,46 @@
 /**
  * @file ota_manager.c
- * @brief OTA boot-state and firmware validation management for the UCM node.
+ * @brief OTA boot-state, firmware validation, and firmware update management.
  *
- * This module is the foundation of the UCM OTA system.
+ * This module manages the UCM OTA lifecycle:
  *
- * Current responsibilities:
- *   - Identify the currently running OTA partition.
- *   - Report the running firmware image and OTA state.
- *   - Detect whether the current image is awaiting first-boot validation.
- *   - Confirm a successfully validated firmware image.
+ *   1. Identify the currently running OTA partition.
+ *   2. Report the running firmware image and OTA state.
+ *   3. Detect PENDING_VERIFY firmware.
+ *   4. Confirm a successfully validated firmware image.
+ *   5. Download and install a new firmware image.
  *
- * OTA download/install is intentionally NOT implemented here yet.
+ * OTA download currently uses the UCM-HUB HTTP server:
+ *
+ *   http://ucm-hub.local/ota/node_test.bin
+ *
+ * HTTPS can be added later. The current goal is to establish and verify
+ * the complete OTA mechanism on the trusted local UCM network.
  *
  * IMPORTANT:
- * A newly installed firmware image may be in
- * ESP_OTA_IMG_PENDING_VERIFY state. We deliberately do not mark it valid
- * in ota_manager_init(). The application must first perform its
- * startup/self-tests and then explicitly confirm the image. This
- * preserves the rollback mechanism.
+ *
+ * A newly installed firmware image enters ESP_OTA_IMG_PENDING_VERIFY.
+ * ota_manager_init() deliberately does NOT confirm it.
+ *
+ * The application must complete its startup/self-tests and then explicitly
+ * call ota_manager_confirm_running_image().
+ *
+ * This preserves the ESP-IDF rollback mechanism.
  */
 
 #include "ota_manager.h"
-#include "esp_http_client.h"
-#include "esp_https_ota.h"
-#include "esp_crt_bundle.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_http_client.h"
+
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_system.h"
 
 static const char *TAG = "UCM_OTA";
-
 
 /**
  * @brief Initialize the OTA manager and report the current boot state.
@@ -126,10 +133,9 @@ esp_err_t ota_manager_init(void)
     return ESP_OK;
 }
 
-
 /**
  * @brief Confirm that the currently running firmware has passed
- *        application-level validation.
+ * application-level validation.
  *
  * Calling this function marks the current OTA image as valid and
  * cancels the pending rollback mechanism.
@@ -139,7 +145,8 @@ esp_err_t ota_manager_init(void)
  */
 esp_err_t ota_manager_confirm_running_image(void)
 {
-    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    esp_err_t err =
+        esp_ota_mark_app_valid_cancel_rollback();
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
@@ -152,20 +159,23 @@ esp_err_t ota_manager_confirm_running_image(void)
 
     return ESP_OK;
 }
+
 /**
  * @brief Download and install a new firmware image.
  *
- * The firmware is written to the inactive OTA partition by ESP-IDF.
- * If the download and image verification succeed, the new partition
- * is selected as the next boot partition.
+ * ESP-IDF selects the inactive OTA partition and writes the downloaded
+ * firmware there.
  *
- * The device is restarted after the new image is selected.
+ * After successful download and image validation, ESP-IDF selects the
+ * new partition as the next boot partition.
  *
- * @param firmware_url HTTP/HTTPS URL of the firmware binary.
+ * The device is then restarted.
+ *
+ * @param firmware_url HTTP or HTTPS URL of the firmware binary.
  *
  * @return ESP_OK if the OTA image was successfully installed and the
- *         next boot partition was selected. This function normally
- *         does not return on success because the device restarts.
+ *         next boot partition was selected. Normally the device restarts
+ *         immediately after a successful update.
  */
 esp_err_t ota_manager_update(const char *firmware_url)
 {
@@ -177,31 +187,246 @@ esp_err_t ota_manager_update(const char *firmware_url)
     ESP_LOGI(TAG, "Starting OTA update");
     ESP_LOGI(TAG, "Firmware URL: %s", firmware_url);
 
+    /*
+     * Find the inactive OTA partition.
+     */
+    const esp_partition_t *update_partition =
+        esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "No OTA update partition available");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG,
+             "OTA target partition: %s "
+             "(offset=0x%08lx size=0x%08lx)",
+             update_partition->label,
+             (unsigned long)update_partition->address,
+             (unsigned long)update_partition->size);
+
+    /*
+     * Configure HTTP client.
+     *
+     * This is intentionally HTTP for the current local UCM-HUB test.
+     * HTTPS can be added later with proper server verification.
+     */
     esp_http_client_config_t http_config = {
         .url = firmware_url,
         .timeout_ms = 10000,
         .keep_alive_enable = true,
     };
 
-    esp_https_ota_config_t ota_config = {
-        .http_config = &http_config,
-    };
+    esp_http_client_handle_t client =
+        esp_http_client_init(&http_config);
 
-    esp_err_t err = esp_https_ota(&ota_config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return ESP_FAIL;
+    }
+
+    /*
+     * Open HTTP connection.
+     */
+    esp_err_t err = esp_http_client_open(client, 0);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
-                 "OTA update failed: %s",
+                 "Failed to open OTA connection: %s",
                  esp_err_to_name(err));
+
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    /*
+     * Get HTTP response headers.
+     */
+    int content_length =
+        esp_http_client_fetch_headers(client);
+
+    if (content_length < 0) {
+        ESP_LOGE(TAG, "Failed to fetch OTA HTTP headers");
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG,
+             "OTA image size: %d bytes",
+             content_length);
+
+    /*
+     * Protect against an image larger than the OTA partition.
+     */
+    if (content_length > 0 &&
+        (size_t)content_length > update_partition->size) {
+
+        ESP_LOGE(TAG,
+                 "OTA image is too large for partition");
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+     * Begin writing the new firmware image.
+     */
+    esp_ota_handle_t ota_handle = 0;
+
+    err = esp_ota_begin(
+        update_partition,
+        OTA_SIZE_UNKNOWN,
+        &ota_handle
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "esp_ota_begin failed: %s",
+                 esp_err_to_name(err));
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return err;
+    }
+
+    uint8_t buffer[4096];
+    int total_read = 0;
+
+    /*
+     * Download the firmware and write it to the inactive
+     * OTA partition.
+     */
+    while (1) {
+
+        int read_len =
+            esp_http_client_read(
+                client,
+                (char *)buffer,
+                sizeof(buffer)
+            );
+
+        if (read_len < 0) {
+
+            ESP_LOGE(TAG, "HTTP read failed");
+
+            esp_ota_abort(ota_handle);
+
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+
+            return ESP_FAIL;
+        }
+
+        if (read_len == 0) {
+            break;
+        }
+
+        err = esp_ota_write(
+            ota_handle,
+            buffer,
+            read_len
+        );
+
+        if (err != ESP_OK) {
+
+            ESP_LOGE(TAG,
+                     "esp_ota_write failed: %s",
+                     esp_err_to_name(err));
+
+            esp_ota_abort(ota_handle);
+
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+
+            return err;
+        }
+
+        total_read += read_len;
+    }
+
+    ESP_LOGI(TAG,
+             "OTA download complete: %d bytes",
+             total_read);
+
+    /*
+     * If the server supplied a Content-Length, make sure we
+     * actually received the complete image.
+     */
+    if (content_length > 0 &&
+        total_read != content_length) {
+
+        ESP_LOGE(TAG,
+                 "OTA download incomplete: received %d of %d bytes",
+                 total_read,
+                 content_length);
+
+        esp_ota_abort(ota_handle);
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return ESP_FAIL;
+    }
+
+    /*
+     * Finish and validate the OTA image.
+     */
+    err = esp_ota_end(ota_handle);
+
+    if (err != ESP_OK) {
+
+        ESP_LOGE(TAG,
+                 "esp_ota_end failed: %s",
+                 esp_err_to_name(err));
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return err;
+    }
+
+    ESP_LOGI(TAG, "OTA image verified successfully");
+
+    /*
+     * Select the newly written partition for the next boot.
+     */
+    err = esp_ota_set_boot_partition(update_partition);
+
+    if (err != ESP_OK) {
+
+        ESP_LOGE(TAG,
+                 "Failed to set OTA boot partition: %s",
+                 esp_err_to_name(err));
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
         return err;
     }
 
     ESP_LOGI(TAG,
-             "OTA update successful. Restarting into new firmware...");
+             "Next boot partition set to: %s",
+             update_partition->label);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    ESP_LOGI(TAG, "OTA update successful");
+    ESP_LOGI(TAG, "Restarting into new firmware...");
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     esp_restart();
 
+    /*
+     * esp_restart() should not return.
+     * Keep this here to satisfy the compiler.
+     */
     return ESP_OK;
 }

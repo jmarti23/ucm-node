@@ -44,6 +44,7 @@
 #include <string.h>
 
 #include "mqtt_manager.h"
+#include "ota_manager.h"
 
 #include "mqtt_client.h"
 #include "esp_log.h"
@@ -51,7 +52,6 @@
 #include "esp_wifi.h"        // esp_wifi_sta_get_ap_info(), used to read Wi-Fi RSSI for the heartbeat
 #include "esp_timer.h"       // esp_timer_get_time(), used to compute uptime for the heartbeat
 #include "app_wifi_prov.h"   // app_wifi_prov_reset_credentials(), used by the remote "provision" command
-
 
 // Broker address as an mDNS hostname (".local") rather than a static IP,
 // so this doesn't need to be reconfigured if the broker's IP changes --
@@ -124,6 +124,26 @@ static void publish_online_status(void)
  *     MQTT_EVENT_DISCONNECTED here; reconnection is left entirely to
  *     esp-mqtt's built-in auto-reconnect behavior.
  */
+
+
+static void ota_update_task(void *pvParameters)
+{
+    const char *firmware_url =
+        "http://ucm-hub.local/ota/node_test.bin";
+
+    ESP_LOGI(TAG, "OTA task started");
+
+    esp_err_t ota_result =
+        ota_manager_update(firmware_url);
+
+    if (ota_result != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "OTA task failed: %s",
+                 esp_err_to_name(ota_result));
+    }
+
+    vTaskDelete(NULL);
+}
 static void mqtt_event_handler(void *handler_args,
                                esp_event_base_t base,
                                int32_t event_id,
@@ -152,7 +172,10 @@ static void mqtt_event_handler(void *handler_args,
         // on whether commands should be broadcast to all nodes or targeted
         // at this one). Left as-is here per instructions not to alter the
         // code; flagging for whoever picks this up next.
-        snprintf(topic, sizeof(topic), "ucm/node/+/command");
+
+        snprintf(topic, sizeof(topic),
+         "ucm/node-%s/command",
+         s_node_id);
 
         ESP_LOGI(TAG, "Subscribe topic='%s' length=%d", topic, strlen(topic));
 
@@ -164,32 +187,77 @@ static void mqtt_event_handler(void *handler_args,
         break;
 
 
-    case MQTT_EVENT_DATA:
+case MQTT_EVENT_DATA:
 
-        ESP_LOGI(TAG, "MQTT command topic: %.*s", event->topic_len, event->topic);
-        ESP_LOGI(TAG, "MQTT command data: %.*s", event->data_len, event->data);
+    ESP_LOGI(TAG, "MQTT command topic: %.*s",
+             event->topic_len, event->topic);
 
-        // Recognizes exactly one command payload: a literal
-        // {"command":"provision"} JSON blob. This is a strict byte-for-byte
-        // match (no JSON parsing), so any whitespace/key-ordering/
-        // additional-fields difference in the incoming payload will fail
-        // to match. NOTE: event->data is not guaranteed to be
-        // NUL-terminated by esp-mqtt (its length is given separately via
-        // event->data_len), and if event->data_len is longer than this
-        // comparison string's length (24 bytes), strncmp will read past
-        // the end of the string literal's storage while comparing --
-        // relying on the incoming payload never being longer than the
-        // expected command for this to stay in-bounds in practice.
-        if (strncmp(event->data, "{\"command\":\"provision\"}", event->data_len) == 0) {
-            ESP_LOGW(TAG, "Provision command received");
-            // Wipes stored Wi-Fi/provisioning credentials and reboots the
-            // device, dropping it back into provisioning mode -- this is
-            // effectively a remote factory-reset trigger for the node.
-            app_wifi_prov_reset_credentials();
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_restart();
-        }
-        break;
+    ESP_LOGI(TAG, "MQTT command data: %.*s",
+             event->data_len, event->data);
+
+
+    /*
+     * ---------------------------------------------------------
+     * PROVISION COMMAND
+     * ---------------------------------------------------------
+     */
+
+    static const char *provision_command =
+        "{\"command\":\"provision\"}";
+
+    size_t provision_command_len =
+        strlen(provision_command);
+
+    if (event->data_len == provision_command_len &&
+        memcmp(event->data,
+               provision_command,
+               provision_command_len) == 0) {
+
+        ESP_LOGW(TAG, "Provision command received");
+
+        app_wifi_prov_reset_credentials();
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        esp_restart();
+    }
+
+
+    /*
+     * ---------------------------------------------------------
+     * OTA COMMAND
+     * ---------------------------------------------------------
+     */
+
+   static const char *ota_command =
+    "{\"command\":\"ota\"}";
+
+size_t ota_command_len =
+    strlen(ota_command);
+
+if (event->data_len == ota_command_len &&
+    memcmp(event->data,
+           ota_command,
+           ota_command_len) == 0) {
+
+    ESP_LOGW(TAG, "OTA command received");
+
+    BaseType_t task_result =
+        xTaskCreate(
+            ota_update_task,
+            "ota_update",
+            8192,
+            NULL,
+            5,
+            NULL
+        );
+
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OTA task");
+    }
+}
+
+    break;
 
 
     default:
