@@ -34,7 +34,7 @@
  * everywhere else in this file for publishing. This is flagged in detail
  * at that subscription site below.
  *
- * BROKER DISCOVERY: connects to "mqtt://UCM-HUB.local", an mDNS hostname
+ * BROKER DISCOVERY: connects to "mqtt://nyit-ucm.nycmesh.net", an mDNS hostname
  * rather than a hardcoded IP (contrast with the earlier draft firmware's
  * hardcoded broker IP) -- this assumes mDNS/Bonjour resolution is enabled
  * and working on the network the node is deployed on.
@@ -56,7 +56,8 @@
 // Broker address as an mDNS hostname (".local") rather than a static IP,
 // so this doesn't need to be reconfigured if the broker's IP changes --
 // relies on mDNS resolution being available on the network.
-#define MQTT_BROKER_URI "mqtt://UCM-HUB.local"
+
+#define MQTT_BROKER_URI "mqtt://nyit-ucm.nycmesh.net"
 
 static const char *TAG = "MQTT_MANAGER";
 
@@ -128,9 +129,12 @@ static void publish_online_status(void)
 
 static void ota_update_task(void *pvParameters)
 {
+ /*   const char *firmware_url =
+  *      "http://ucm-hub.local/ota/ucm-node.bin";
+  */ 
     const char *firmware_url =
-        "http://ucm-hub.local/ota/node_test.bin";
-
+        "http://nyit-ucm.nycmesh.net/ota/ucm-node.bin";
+    
     ESP_LOGI(TAG, "OTA task started");
 
     esp_err_t ota_result =

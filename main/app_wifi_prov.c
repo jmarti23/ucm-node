@@ -122,9 +122,9 @@ static const char SETUP_FORM_HTML[] =
 "<label>Description</label>"
 "<input name='desc' maxlength='63'>"
 "<label>Latitude</label>"
-"<input name='lat' type='text' inputmode='decimal' placeholder='e.g. 40.7128'>"
+"<input name='lat' type='text' inputmode='text' placeholder='e.g. 40.7128'>"
 "<label>Longitude</label>"
-"<input name='lon' type='text' inputmode='decimal' placeholder='e.g. -74.0060'>"
+"<input name='lon' type='text' inputmode='text' placeholder='e.g. -74.0060'>"
 "<button type='submit'>Save &amp; Connect</button>"
 "</form></body></html>";
 
